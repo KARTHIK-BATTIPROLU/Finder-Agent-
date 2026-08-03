@@ -11,6 +11,7 @@ import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
@@ -30,11 +31,9 @@ def sanitize_filename(name: str) -> str:
     """
     if not name:
         return "UNKNOWN"
-    # Remove control characters & illegal filename characters: \ / : * ? " < > |
     sanitized = re.sub(r'[\\/*?:"<>|\r\n\t]', "_", name)
-    # Collapse multiple spaces or underscores
     sanitized = re.sub(r"[\s_]+", "_", sanitized).strip("_")
-    return sanitized[:100]  # Cap length to prevent path length issues
+    return sanitized[:100]
 
 
 class AllotmentScraper:
@@ -83,52 +82,65 @@ class AllotmentScraper:
         logger.info("Playwright browser session closed.")
 
     async def navigate(self, url: str) -> None:
-        """Navigates to the target allotment portal and waits for load."""
-        if not self.page:
+        """Navigates to target allotment portal setting required Referer headers."""
+        if not self.page or not self.context:
             raise RuntimeError("Browser page not initialized. Call start() first.")
         
-        logger.info(f"Navigating to URL: {url}")
+        parsed = urlparse(url)
+        domain_origin = f"{parsed.scheme}://{parsed.netloc}"
+        referer = f"{domain_origin}/default.aspx"
+        
+        logger.info(f"Setting Referer header to '{referer}' and navigating to: {url}")
+        await self.context.set_extra_http_headers({
+            "Referer": referer,
+            "Accept-Language": "en-US,en;q=0.9"
+        })
+
+        # Pre-visit home page to ensure session & cookies are initialized properly
+        try:
+            await self.page.goto(domain_origin, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.warning(f"Home page pre-visit warning for {domain_origin}: {e}")
+
         await self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         await self.page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         logger.info(f"Successfully loaded {url}")
 
     async def _locate_select(self, keywords: List[str]) -> Optional[str]:
-        """Locates a <select> element by ID, name, or label keywords."""
+        """Locates a <select> element by ID, name, or index fallback."""
         if not self.page:
             return None
         
-        # Try generic select elements on page
         selects = await self.page.query_selector_all("select")
+        if not selects:
+            return None
+
         for select in selects:
             select_id = (await select.get_attribute("id") or "").lower()
             select_name = (await select.get_attribute("name") or "").lower()
             
             for keyword in keywords:
                 if keyword in select_id or keyword in select_name:
-                    return f"select#{await select.get_attribute('id')}" if select_id else None
+                    actual_id = await select.get_attribute("id")
+                    if actual_id:
+                        return f"#{actual_id}"
 
-        # Fallback: return first/second select based on keyword
-        if selects:
-            if "college" in keywords[0] and len(selects) >= 1:
-                return "select >> nth=0"
-            elif "branch" in keywords[0] and len(selects) >= 2:
-                return "select >> nth=1"
-            elif len(selects) >= 1:
-                return "select >> nth=0"
-
-        return None
+        # Fallback by position
+        if "college" in keywords[0] and len(selects) >= 1:
+            return "select >> nth=0"
+        elif "branch" in keywords[0] and len(selects) >= 2:
+            return "select >> nth=1"
+        
+        return "select >> nth=0"
 
     async def get_college_options(self) -> List[Dict[str, str]]:
-        """
-        Extracts all valid college dropdown options.
-
-        Returns:
-            List of dicts containing 'text', 'value', and 'index'.
-        """
+        """Extracts valid college dropdown options."""
         if not self.page:
             return []
 
-        select_selector = await self._locate_select(["college", "dist", "inst"]) or "select >> nth=0"
+        select_selector = await self._locate_select(["college", "ddlcollege", "inst"]) or "select >> nth=0"
+        logger.info(f"Using college select selector: {select_selector}")
         await self.page.wait_for_selector(select_selector, state="visible", timeout=self.timeout_ms)
 
         options = await self.page.eval_on_selector_all(
@@ -136,45 +148,38 @@ class AllotmentScraper:
             "options => options.map(o => ({ text: o.innerText.trim(), value: o.value.trim() }))"
         )
 
-        # Filter out placeholder items like "Select", "-- Select College --", etc.
         valid_options = []
         for idx, opt in enumerate(options):
             txt = opt["text"].strip()
             val = opt["value"].strip()
-            if val and not any(placeholder in txt.lower() for placeholder in ["select", "--", "choose"]):
+            if val and not any(p in txt.lower() for p in ["select", "--", "choose", "0"]):
                 valid_options.append({"index": idx, "text": txt, "value": val})
 
         logger.info(f"Extracted {len(valid_options)} valid college options.")
         return valid_options
 
     async def select_college(self, value: str, text: Optional[str] = None) -> None:
-        """
-        Selects a College option and waits for ASP.NET PostBack network idle.
-        """
+        """Selects a College option and waits for ASP.NET PostBack network idle."""
         if not self.page:
             return
 
-        select_selector = await self._locate_select(["college", "dist", "inst"]) or "select >> nth=0"
+        select_selector = await self._locate_select(["college", "ddlcollege", "inst"]) or "select >> nth=0"
         logger.info(f"Selecting College: '{text or value}' (value='{value}')")
 
-        # ASP.NET WebForms trigger PostBack on select change
         await self.page.select_option(select_selector, value=value)
-        
-        # Wait for ASP.NET PostBack network idle
         try:
             await self.page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
-            logger.warning("networkidle timeout after selecting college; continuing after 2s delay.")
+            logger.warning("networkidle timeout after selecting college; sleeping 2s.")
             await asyncio.sleep(2.0)
 
     async def get_branch_options(self) -> List[Dict[str, str]]:
-        """
-        Extracts all valid branch options from the second dropdown after PostBack.
-        """
+        """Extracts valid branch options after ASP.NET PostBack."""
         if not self.page:
             return []
 
-        select_selector = await self._locate_select(["branch", "course", "spec"]) or "select >> nth=1"
+        select_selector = await self._locate_select(["branch", "ddlbranch", "course"]) or "select >> nth=1"
+        logger.info(f"Using branch select selector: {select_selector}")
         await self.page.wait_for_selector(select_selector, state="visible", timeout=self.timeout_ms)
 
         options = await self.page.eval_on_selector_all(
@@ -186,42 +191,37 @@ class AllotmentScraper:
         for idx, opt in enumerate(options):
             txt = opt["text"].strip()
             val = opt["value"].strip()
-            if val and not any(placeholder in txt.lower() for placeholder in ["select", "--", "choose"]):
+            if val and not any(p in txt.lower() for p in ["select", "--", "choose", "0"]):
                 valid_options.append({"index": idx, "text": txt, "value": val})
 
         logger.info(f"Extracted {len(valid_options)} valid branch options.")
         return valid_options
 
     async def select_branch(self, value: str, text: Optional[str] = None) -> None:
-        """
-        Selects a Branch option and waits for PostBack to settle.
-        """
+        """Selects a Branch option and waits for PostBack to settle."""
         if not self.page:
             return
 
-        select_selector = await self._locate_select(["branch", "course", "spec"]) or "select >> nth=1"
+        select_selector = await self._locate_select(["branch", "ddlbranch", "course"]) or "select >> nth=1"
         logger.info(f"Selecting Branch: '{text or value}' (value='{value}')")
 
         await self.page.select_option(select_selector, value=value)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
-            logger.warning("networkidle timeout after selecting branch; continuing after 1.5s delay.")
+            logger.warning("networkidle timeout after selecting branch; sleeping 1.5s.")
             await asyncio.sleep(1.5)
 
     async def trigger_show_allotments(self) -> None:
-        """
-        Clicks the 'Show Allotments' button and waits for the data table to load.
-        """
+        """Clicks the 'Show Allotments' button and waits for the data table to render."""
         if not self.page:
             return
 
         button_selectors = [
-            "input[type='submit']",
+            "#MainContent_btn_allot",
             "input[value*='Show']",
+            "input[type='submit']",
             "button:has-text('Show')",
-            "button:has-text('Submit')",
-            "button:has-text('Search')",
             "#btnShow",
             "#btnSubmit"
         ]
@@ -235,34 +235,24 @@ class AllotmentScraper:
                 break
 
         if not clicked:
-            # Fallback to pressing Enter on the page or submitting form
             logger.warning("No explicit button matched selector list. Pressing Enter...")
             await self.page.keyboard.press("Enter")
 
         try:
             await self.page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
         except Exception:
-            logger.warning("networkidle timeout after clicking show allotments; waiting 2s.")
+            logger.warning("networkidle timeout after clicking show allotments; sleeping 2s.")
             await asyncio.sleep(2.0)
 
     async def export_pdf(self, output_path: str) -> str:
-        """
-        Emulates print media style and exports current page view as PDF.
-
-        Args:
-            output_path: Target filepath for the saved PDF.
-
-        Returns:
-            Absolute filepath of saved PDF.
-        """
+        """Emulates print media style and exports current view as PDF."""
         if not self.page:
             raise RuntimeError("Browser page not initialized.")
 
-        # Ensure target directory exists
         dest = Path(output_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Emulating print media type and writing PDF to: {dest.resolve()}")
+        logger.info(f"Emulating print media type and exporting PDF to: {dest.resolve()}")
         await self.page.emulate_media(media="print")
         
         await self.page.pdf(
@@ -272,7 +262,6 @@ class AllotmentScraper:
             margin={"top": "1cm", "bottom": "1cm", "left": "1cm", "right": "1cm"}
         )
         
-        # Reset media emulation back to screen
         await self.page.emulate_media(media="screen")
         logger.info(f"PDF exported successfully ({dest.stat().st_size} bytes)")
         return str(dest.resolve())
