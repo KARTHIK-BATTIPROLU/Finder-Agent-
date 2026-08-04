@@ -2,7 +2,8 @@
 main.py - Entry Point for the Autonomous Allotment Extraction System.
 
 Initializes MongoDB connections, constructs the LangGraph state machine,
-and iterates over configured Telangana entrance exam allotment portals.
+and continuously iterates over target Telangana entrance exam portals with automatic
+retry from MongoDB checkpoints until target college (WITS) is fully completed.
 """
 
 import asyncio
@@ -40,7 +41,7 @@ TARGET_CONFIGS: List[Dict[str, str]] = [
 
 
 async def run_allotment_extraction():
-    """Main execution routine orchestrating extraction across all target URLs."""
+    """Main execution routine orchestrating extraction across target URLs with resilient retries."""
     logger.info("==========================================================")
     logger.info("   Starting Autonomous Allotment Extraction System       ")
     logger.info("==========================================================")
@@ -77,17 +78,27 @@ async def run_allotment_extraction():
                 "stop_at_college_code": stop_code
             }
 
-            final_state = await app_graph.ainvoke(initial_state)
+            # Resilient retry loop from MongoDB checkpoints
+            retry_count = 0
+            max_retries = 50
 
-            if final_state.get("error"):
-                logger.error(
-                    f"Execution for {exam_name} finished with error: {final_state['error']}. "
-                    f"State saved in MongoDB. Re-run to resume."
-                )
-            elif final_state.get("completed"):
-                logger.info(f"SUCCESS: Completed extraction for {exam_name} up to '{stop_code}'.")
-            else:
-                logger.info(f"Execution finished for {exam_name}.")
+            while retry_count < max_retries:
+                final_state = await app_graph.ainvoke(initial_state)
+
+                if final_state.get("completed"):
+                    logger.info(f"SUCCESS: Completed extraction for {exam_name} up to '{stop_code}'.")
+                    break
+
+                if final_state.get("error"):
+                    retry_count += 1
+                    logger.warning(
+                        f"Network timeout/error encountered for {exam_name}: {final_state['error']}. "
+                        f"Auto-resuming attempt {retry_count}/{max_retries} from MongoDB checkpoint in 3s..."
+                    )
+                    await cleanup_active_scraper()
+                    await asyncio.sleep(3.0)
+                else:
+                    break
 
     except KeyboardInterrupt:
         logger.warning("Execution interrupted by user.")
