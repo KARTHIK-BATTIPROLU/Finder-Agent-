@@ -18,7 +18,6 @@ from graph import ScraperState, build_scraper_graph, cleanup_active_scraper
 
 load_dotenv()
 
-# Configure logging format
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,7 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AllotmentExtractionSystem")
 
-# Configurable list of target portals (easily extensible)
 TARGET_CONFIGS: List[Dict[str, str]] = [
     {
         "exam_name": "TG_ECET",
@@ -38,11 +36,6 @@ TARGET_CONFIGS: List[Dict[str, str]] = [
         "exam_name": "TG_POLYCET",
         "url": "https://tgpolycet.nic.in/college_allotment.aspx"
     }
-    # Future portals can be added here easily:
-    # {
-    #     "exam_name": "TG_EAPCET",
-    #     "url": "https://tgeapcet.nic.in/college_allotment.aspx"
-    # }
 ]
 
 
@@ -52,7 +45,6 @@ async def run_allotment_extraction():
     logger.info("   Starting Autonomous Allotment Extraction System       ")
     logger.info("==========================================================")
 
-    # Initialize Database connection
     try:
         await get_db()
     except Exception as e:
@@ -60,10 +52,9 @@ async def run_allotment_extraction():
         logger.error("Please ensure MongoDB is running or check your MONGO_URI in .env")
         return
 
-    # Build LangGraph State Machine
     app_graph = build_scraper_graph()
-
     output_dir = os.getenv("OUTPUT_DIR", "outputs")
+    stop_code = os.getenv("STOP_AT_COLLEGE_CODE", "WITS")
 
     try:
         for config in TARGET_CONFIGS:
@@ -71,6 +62,7 @@ async def run_allotment_extraction():
             url = config["url"]
 
             logger.info(f"\n>>> Starting Processing for Exam Portal: {exam_name} ({url}) <<<")
+            logger.info(f"Target College Stop Code: '{stop_code}'")
 
             initial_state: ScraperState = {
                 "url": url,
@@ -81,10 +73,10 @@ async def run_allotment_extraction():
                 "branches": [],
                 "completed": False,
                 "error": None,
-                "output_dir": output_dir
+                "output_dir": output_dir,
+                "stop_at_college_code": stop_code
             }
 
-            # Execute graph state machine
             final_state = await app_graph.ainvoke(initial_state)
 
             if final_state.get("error"):
@@ -93,7 +85,7 @@ async def run_allotment_extraction():
                     f"State saved in MongoDB. Re-run to resume."
                 )
             elif final_state.get("completed"):
-                logger.info(f"SUCCESS: Completed extraction for {exam_name}.")
+                logger.info(f"SUCCESS: Completed extraction for {exam_name} up to '{stop_code}'.")
             else:
                 logger.info(f"Execution finished for {exam_name}.")
 

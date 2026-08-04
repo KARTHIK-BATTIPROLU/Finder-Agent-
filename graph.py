@@ -3,6 +3,7 @@ graph.py - LangGraph Orchestration & Stateful Execution with MongoDB Checkpointi
 
 Manages the autonomous scraping lifecycle, state transitions, index advancement,
 and failure recovery for the Autonomous Allotment Extraction System.
+Organizes PDFs into college-specific subfolders: /outputs/<exam_name>/<college_code>/<branch_code>.pdf.
 """
 
 import logging
@@ -18,7 +19,6 @@ from scraper import AllotmentScraper, sanitize_filename
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Default Output directory
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
 
 
@@ -35,9 +35,9 @@ class ScraperState(TypedDict):
     completed: bool
     error: Optional[str]
     output_dir: str
+    stop_at_college_code: Optional[str]
 
 
-# Global scraper instance managed per execution run
 _scraper: Optional[AllotmentScraper] = None
 
 
@@ -62,9 +62,7 @@ async def cleanup_active_scraper() -> None:
 
 # Node 1: Initialize State & Resume Checkpoint
 async def init_node(state: ScraperState) -> ScraperState:
-    """
-    Initializes state and fetches existing MongoDB checkpoints to resume progress.
-    """
+    """Initializes state and fetches existing MongoDB checkpoints."""
     url = state["url"]
     exam_name = state["exam_name"]
     logger.info(f"--- [NODE: Init] Initializing scraper state for {exam_name} ({url}) ---")
@@ -98,9 +96,7 @@ async def init_node(state: ScraperState) -> ScraperState:
 
 # Node 2: Fetch Colleges
 async def fetch_colleges_node(state: ScraperState) -> ScraperState:
-    """
-    Navigates to URL and extracts all college dropdown options.
-    """
+    """Navigates to URL and extracts all college dropdown options."""
     if state["completed"]:
         return state
 
@@ -125,9 +121,7 @@ async def fetch_colleges_node(state: ScraperState) -> ScraperState:
 
 # Node 3: Select College & Fetch Branches
 async def select_college_node(state: ScraperState) -> ScraperState:
-    """
-    Selects the college at `college_index` and extracts its branches.
-    """
+    """Selects the college at `college_index` and extracts its branches."""
     if state["completed"] or state.get("error"):
         return state
 
@@ -174,7 +168,8 @@ async def select_college_node(state: ScraperState) -> ScraperState:
 # Node 4: Scrape & Export PDF for Current Branch
 async def scrape_branch_node(state: ScraperState) -> ScraperState:
     """
-    Selects current branch, renders allotment table, exports PDF, and updates MongoDB checkpoint.
+    Selects current branch, renders allotment table, exports PDF into college subfolder,
+    and updates MongoDB checkpoint.
     """
     if state["completed"] or state.get("error"):
         return state
@@ -201,18 +196,20 @@ async def scrape_branch_node(state: ScraperState) -> ScraperState:
         await scraper.select_branch(value=current_branch["value"], text=current_branch["text"])
         await scraper.trigger_show_allotments()
 
-        # Build output filepath: /outputs/<exam_name>/<college_code>_<branch_code>.pdf
+        # Build college subfolder path: /outputs/<exam_name>/<college_code>/<branch_code>.pdf
         coll_code = sanitize_filename(current_college["value"] or current_college["text"])
         branch_code = sanitize_filename(current_branch["value"] or current_branch["text"])
+        
         pdf_path = os.path.join(
             state.get("output_dir", OUTPUT_DIR),
             exam_name,
-            f"{coll_code}_{branch_code}.pdf"
+            coll_code,
+            f"{branch_code}.pdf"
         )
 
         await scraper.export_pdf(pdf_path)
 
-        # Update MongoDB checkpoint immediately after successful PDF export
+        # Update MongoDB checkpoint
         await save_checkpoint(
             url=state["url"],
             exam_name=exam_name,
@@ -229,9 +226,7 @@ async def scrape_branch_node(state: ScraperState) -> ScraperState:
 
 # Node 5: Advance Index
 async def advance_index_node(state: ScraperState) -> ScraperState:
-    """
-    Advances branch_index or resets branch_index and advances college_index.
-    """
+    """Advances branch_index or resets branch_index and advances college_index."""
     if state["completed"] or state.get("error"):
         return state
 
@@ -239,9 +234,31 @@ async def advance_index_node(state: ScraperState) -> ScraperState:
     branch_idx = state["branch_index"] + 1
     branches = state["branches"]
     colleges = state["colleges"]
+    stop_code = state.get("stop_at_college_code")
 
     if branch_idx >= len(branches):
-        # All branches for current college finished; advance college
+        current_college = colleges[college_idx] if college_idx < len(colleges) else None
+        
+        # Check if we reached the target stop college (e.g. WITS) and finished all its branches
+        if current_college and stop_code:
+            coll_val = current_college["value"].upper()
+            coll_txt = current_college["text"].upper()
+            if stop_code.upper() in coll_val or stop_code.upper() in coll_txt:
+                logger.info(f"=== Target College '{stop_code}' finished completely! Stopping state machine. ===")
+                await save_checkpoint(
+                    url=state["url"],
+                    exam_name=state["exam_name"],
+                    college_index=college_idx + 1,
+                    branch_index=0,
+                    completed=True
+                )
+                return {
+                    **state,
+                    "college_index": college_idx + 1,
+                    "branch_index": 0,
+                    "completed": True
+                }
+
         next_college_idx = college_idx + 1
         next_branch_idx = 0
         if next_college_idx >= len(colleges):
@@ -270,11 +287,8 @@ async def advance_index_node(state: ScraperState) -> ScraperState:
     return {**state, "branch_index": branch_idx}
 
 
-# Conditional Edge Router
 def route_next_step(state: ScraperState) -> str:
-    """
-    Routes graph execution based on state flags and branch loop progress.
-    """
+    """Routes graph execution based on state flags and branch loop progress."""
     if state.get("error"):
         logger.error(f"Graph halting due to error: {state['error']}")
         return "error_handler"
@@ -298,11 +312,8 @@ def route_next_step(state: ScraperState) -> str:
     return "scrape_branch"
 
 
-# Error Handler Node
 async def error_handler_node(state: ScraperState) -> ScraperState:
-    """
-    Gracefully logs failure details so state machine can be cleanly re-run from MongoDB checkpoint.
-    """
+    """Logs failure details so state machine can resume from MongoDB checkpoint."""
     logger.critical(
         f"Execution failed at College[{state['college_index']}], Branch[{state['branch_index']}]: "
         f"{state.get('error')}. MongoDB checkpoint preserved for instant resume."
@@ -311,12 +322,9 @@ async def error_handler_node(state: ScraperState) -> ScraperState:
 
 
 def build_scraper_graph() -> StateGraph:
-    """
-    Constructs and compiles the LangGraph state machine.
-    """
+    """Constructs and compiles the LangGraph state machine."""
     workflow = StateGraph(ScraperState)
 
-    # Add Nodes
     workflow.add_node("init", init_node)
     workflow.add_node("fetch_colleges", fetch_colleges_node)
     workflow.add_node("select_college", select_college_node)
@@ -324,7 +332,6 @@ def build_scraper_graph() -> StateGraph:
     workflow.add_node("advance_index", advance_index_node)
     workflow.add_node("error_handler", error_handler_node)
 
-    # Define Graph Flow Edges
     workflow.set_entry_point("init")
     workflow.add_edge("init", "fetch_colleges")
     workflow.add_edge("fetch_colleges", "select_college")
